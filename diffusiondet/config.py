@@ -18,6 +18,7 @@ def add_diffusiondet_config(cfg):
 
     # RCNN Head.
     cfg.MODEL.DiffusionDet.NHEADS = 8
+    
     cfg.MODEL.DiffusionDet.DROPOUT = 0.0
     cfg.MODEL.DiffusionDet.DIM_FEEDFORWARD = 2048
     cfg.MODEL.DiffusionDet.ACTIVATION = 'relu'

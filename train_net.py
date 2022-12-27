@@ -51,8 +51,10 @@ class Trainer(DefaultTrainer):
             setup_logger()
         cfg = DefaultTrainer.auto_scale_workers(cfg, comm.get_world_size())
 
+        
         # Assume these objects must be constructed in this order.
         model = self.build_model(cfg)
+        
         optimizer = self.build_optimizer(cfg, model)
         data_loader = self.build_train_loader(cfg)
 
@@ -253,6 +255,7 @@ def setup(args):
     cfg = get_cfg()
     add_diffusiondet_config(cfg)
     add_model_ema_configs(cfg)
+    
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
@@ -265,6 +268,7 @@ def main(args):
 
     if args.eval_only:
         model = Trainer.build_model(cfg)
+        
         kwargs = may_get_ema_checkpointer(cfg, model)
         if cfg.MODEL_EMA.ENABLED:
             EMADetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR, **kwargs).resume_or_load(cfg.MODEL.WEIGHTS,
@@ -277,6 +281,7 @@ def main(args):
             res.update(Trainer.test_with_TTA(cfg, model))
         if comm.is_main_process():
             verify_results(cfg, res)
+        
         return res
 
     trainer = Trainer(cfg)

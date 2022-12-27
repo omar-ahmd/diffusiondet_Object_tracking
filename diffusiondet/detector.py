@@ -9,11 +9,11 @@ import math
 import random
 from typing import List
 from collections import namedtuple
-
+import time
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+import numpy as np
 from detectron2.layers import batched_nms
 from detectron2.modeling import META_ARCH_REGISTRY, build_backbone, detector_postprocess
 
@@ -72,6 +72,7 @@ class DiffusionDet(nn.Module):
 
         self.in_features = cfg.MODEL.ROI_HEADS.IN_FEATURES
         self.num_classes = cfg.MODEL.DiffusionDet.NUM_CLASSES
+
         self.num_proposals = cfg.MODEL.DiffusionDet.NUM_PROPOSALS
         self.hidden_dim = cfg.MODEL.DiffusionDet.HIDDEN_DIM
         self.num_heads = cfg.MODEL.DiffusionDet.NUM_HEADS
@@ -95,7 +96,7 @@ class DiffusionDet(nn.Module):
         assert self.sampling_timesteps <= timesteps
         self.is_ddim_sampling = self.sampling_timesteps < timesteps
         self.ddim_sampling_eta = 1.
-        self.self_condition = False
+        self.self_condition = cfg.SELF_CONDITION
         self.scale = cfg.MODEL.DiffusionDet.SNR_SCALE
         self.box_renewal = True
         self.use_ensemble = True
@@ -103,7 +104,7 @@ class DiffusionDet(nn.Module):
         self.register_buffer('betas', betas)
         self.register_buffer('alphas_cumprod', alphas_cumprod)
         self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
-
+        
         # calculations for diffusion q(x_t | x_{t-1}) and others
 
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
@@ -126,7 +127,7 @@ class DiffusionDet(nn.Module):
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2',
                              (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
-
+        
         # Build Dynamic Head.
         self.head = DynamicHead(cfg=cfg, roi_input_shape=self.backbone.output_shape())
         # Loss parameters:
@@ -160,60 +161,99 @@ class DiffusionDet(nn.Module):
         pixel_std = torch.Tensor(cfg.MODEL.PIXEL_STD).to(self.device).view(3, 1, 1)
         self.normalizer = lambda x: (x - pixel_mean) / pixel_std
         self.to(self.device)
-
+        
     def predict_noise_from_start(self, x_t, t, x0):
         return (
                 (extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t - x0) /
                 extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
         )
 
+
+    def prepare_cond(self, previous_frame, x, size):
+        """
+        :param gt_boxes: (cx, cy, w, h), normalized
+        :param num_proposals:
+        """
+        num_gt = previous_frame.shape[1]
+        x = torch.clamp(x[:,num_gt:,:], min=-1 * self.scale, max=self.scale)
+        x = ((x / self.scale) + 1) / 2
+        x = box_cxcywh_to_xyxy(x)
+        boxes = previous_frame
+        boxes = boxes / size
+
+        if num_gt < self.num_proposals:
+            x_start = torch.cat((boxes, x), dim=1)
+        elif num_gt > self.num_proposals:
+            select_mask = [True] * self.num_proposals + [False] * (num_gt - self.num_proposals)
+            random.shuffle(select_mask)
+            x_start = boxes[:,select_mask]
+        else:
+            x_start = boxes
+
+        
+        return x_start
+
     def model_predictions(self, backbone_feats, images_whwh, x, t, x_self_cond=None, clip_x_start=False):
-        x_boxes = torch.clamp(x, min=-1 * self.scale, max=self.scale)
-        x_boxes = ((x_boxes / self.scale) + 1) / 2
-        x_boxes = box_cxcywh_to_xyxy(x_boxes)
+        if x_self_cond is None:
+            x_boxes = torch.clamp(x, min=-1 * self.scale, max=self.scale)
+            x_boxes = ((x_boxes / self.scale) + 1) / 2
+            x_boxes = box_cxcywh_to_xyxy(x_boxes)
+        else:
+            x_boxes = self.prepare_cond(x_self_cond, x, images_whwh)
+
         x_boxes = x_boxes * images_whwh[:, None, :]
         outputs_class, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
-
         x_start = outputs_coord[-1]  # (batch, num_proposals, 4) predict boxes: absolute coordinates (x1, y1, x2, y2)
         x_start = x_start / images_whwh[:, None, :]
         x_start = box_xyxy_to_cxcywh(x_start)
         x_start = (x_start * 2 - 1.) * self.scale
         x_start = torch.clamp(x_start, min=-1 * self.scale, max=self.scale)
+        
+        
         pred_noise = self.predict_noise_from_start(x, t, x_start)
 
         return ModelPrediction(pred_noise, x_start), outputs_class, outputs_coord
 
     @torch.no_grad()
-    def ddim_sample(self, batched_inputs, backbone_feats, images_whwh, images, clip_denoised=True, do_postprocess=True):
+    def ddim_sample1(self, batched_inputs, backbone_feats, images_whwh, images, \
+        previous_frame=None, in_time=None, clip_denoised=True, do_postprocess=True):
+
+
+        previous_frame = previous_frame[0][0]['instances']._fields['pred_boxes'].tensor
         batch = images_whwh.shape[0]
+
         shape = (batch, self.num_proposals, 4)
-        total_timesteps, sampling_timesteps, eta, objective = self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+        total_timesteps, sampling_timesteps, eta, objective = self.num_timesteps, \
+            self.sampling_timesteps, \
+            self.ddim_sampling_eta, \
+            self.objective
 
         # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
-        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1)
-        times = list(reversed(times.int().tolist()))
+        times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1, dtype = int)
+        times = list(reversed(times.tolist()))
         time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+        x_start = previous_frame 
 
         img = torch.randn(shape, device=self.device)
 
         ensemble_score, ensemble_label, ensemble_coord = [], [], []
-        x_start = None
+        
         for time, time_next in time_pairs:
             time_cond = torch.full((batch,), time, device=self.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
 
             preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
-                                                                         self_cond, clip_x_start=clip_denoised)
+                                                                        self_cond, clip_x_start=clip_denoised)
             pred_noise, x_start = preds.pred_noise, preds.pred_x_start
-
+            
             if self.box_renewal:  # filter
+                
                 score_per_image, box_per_image = outputs_class[-1][0], outputs_coord[-1][0]
                 threshold = 0.5
                 score_per_image = torch.sigmoid(score_per_image)
                 value, _ = torch.max(score_per_image, -1, keepdim=False)
-                keep_idx = value > threshold
+                keep_idx = value >= threshold
                 num_remain = torch.sum(keep_idx)
-
                 pred_noise = pred_noise[:, keep_idx, :]
                 x_start = x_start[:, keep_idx, :]
                 img = img[:, keep_idx, :]
@@ -221,30 +261,35 @@ class DiffusionDet(nn.Module):
                 img = x_start
                 continue
 
+            num_remain = x_start.shape[1]
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
 
             sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
             c = (1 - alpha_next - sigma ** 2).sqrt()
-
+            
             noise = torch.randn_like(img)
-
+            
             img = x_start * alpha_next.sqrt() + \
-                  c * pred_noise + \
-                  sigma * noise
-
+                c * pred_noise + \
+                sigma * noise
+            
             if self.box_renewal:  # filter
                 # replenish with randn boxes
                 img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device=img.device)), dim=1)
+            
+
             if self.use_ensemble and self.sampling_timesteps > 1:
                 box_pred_per_image, scores_per_image, labels_per_image = self.inference(outputs_class[-1],
                                                                                         outputs_coord[-1],
                                                                                         images.image_sizes)
+                
                 ensemble_score.append(scores_per_image)
                 ensemble_label.append(labels_per_image)
                 ensemble_coord.append(box_pred_per_image)
 
-        if self.use_ensemble and self.sampling_timesteps > 1:
+        if self.use_ensemble and (self.sampling_timesteps > 1):
+            
             box_pred_per_image = torch.cat(ensemble_coord, dim=0)
             scores_per_image = torch.cat(ensemble_score, dim=0)
             labels_per_image = torch.cat(ensemble_label, dim=0)
@@ -271,19 +316,174 @@ class DiffusionDet(nn.Module):
                 width = input_per_image.get("width", image_size[1])
                 r = detector_postprocess(results_per_image, height, width)
                 processed_results.append({"instances": r})
-            return processed_results
+            return processed_results, (processed_results, img, pred_noise)
+
+
+    @torch.no_grad()
+    def ddim_sample(self, batched_inputs, backbone_feats, images_whwh, images, previous_frame=None, in_time=None, clip_denoised=True, do_postprocess=True):
+        batch = images_whwh.shape[0]
+
+        shape = (batch, self.num_proposals, 4)
+        total_timesteps, sampling_timesteps, eta, objective = self.num_timesteps, \
+            self.sampling_timesteps, \
+            self.ddim_sampling_eta, \
+            self.objective
+        ensemble_score, ensemble_label, ensemble_coord = [], [], []
+        if previous_frame is None or self.self_condition: # Without Initilisation
+            # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+            if previous_frame:
+                previous_frame = previous_frame[0][0]['instances']._fields['pred_boxes'].tensor[None,:,:]
+            times = torch.linspace(-1, total_timesteps - 1, steps=sampling_timesteps + 1, dtype = int)
+            times = list(reversed(times.tolist()))
+            time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+            x_start = previous_frame
+            img = torch.randn(shape, device=self.device)
+            if in_time is not None and self.sampling_timesteps == 1:
+                in_time = int(in_time[0][0])
+                times = np.array([-1, in_time])
+                times = list(reversed(times.tolist()))
+                time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+
+            for time, time_next in time_pairs:
+                time_cond = torch.full((batch,), time, device=self.device, dtype=torch.long)
+                self_cond = x_start if self.self_condition else None
+
+                preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
+                                                                            self_cond, clip_x_start=clip_denoised)
+                pred_noise, x_start = preds.pred_noise, preds.pred_x_start
+                
+                if self.box_renewal:  # filter
+                    score_per_image, box_per_image = outputs_class[-1][0], outputs_coord[-1][0]
+                    threshold = 0.3
+                    score_per_image = torch.sigmoid(score_per_image)
+                    value, _ = torch.max(score_per_image, -1, keepdim=False)
+                    keep_idx = value >= threshold
+                    num_remain = torch.sum(keep_idx)
+                    pred_noise = pred_noise[:, keep_idx, :]
+                    x_start = x_start[:, keep_idx, :]
+                    img = img[:, keep_idx, :]
+                if time_next < 0:
+                    img = x_start
+                    continue
+                num_remain = x_start.shape[1]
+                alpha = self.alphas_cumprod[time]
+                alpha_next = self.alphas_cumprod[time_next]
+
+                sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+                c = (1 - alpha_next - sigma ** 2).sqrt()
+
+                noise = torch.randn_like(img)
+                img = x_start * alpha_next.sqrt() + \
+                    c * pred_noise + \
+                    sigma * noise
+                
+                if self.box_renewal:  # filter
+                    # replenish with randn boxes
+                    img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device=img.device)), dim=1)
+                
+
+                if self.use_ensemble and self.sampling_timesteps > 1:
+                    box_pred_per_image, scores_per_image, labels_per_image = self.inference(outputs_class[-1],
+                                                                                            outputs_coord[-1],
+                                                                                            images.image_sizes)
+                    
+                    ensemble_score.append(scores_per_image)
+                    ensemble_label.append(labels_per_image)
+                    ensemble_coord.append(box_pred_per_image)
+
+            if self.use_ensemble and self.sampling_timesteps > 1:
+                box_pred_per_image = torch.cat(ensemble_coord, dim=0)
+                scores_per_image = torch.cat(ensemble_score, dim=0)
+                labels_per_image = torch.cat(ensemble_label, dim=0)
+                if self.use_nms:
+                    keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, 0.5)
+                    box_pred_per_image = box_pred_per_image[keep]
+                    scores_per_image = scores_per_image[keep]
+                    labels_per_image = labels_per_image[keep]
+
+                result = Instances(images.image_sizes[0])
+                result.pred_boxes = Boxes(box_pred_per_image)
+                result.scores = scores_per_image
+                result.pred_classes = labels_per_image
+                results = [result]
+            else:
+                output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+                box_cls = output["pred_logits"]
+                box_pred = output["pred_boxes"]
+                results = self.inference(box_cls, box_pred, images.image_sizes)
+        else: #Use the previous frame as initilisation
+            if in_time is None: 
+                in_time = 50
+            else:
+                in_time = int(in_time[0][0])
+            times = np.array([-1, in_time, 999])
+            times = list(reversed(times.tolist()))
+            time_pairs = list(zip(times[:-1], times[1:]))  # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
+            x_start = previous_frame[1] if previous_frame else None
+            
+
+            num_remain = x_start.shape[1]
+            alpha = self.alphas_cumprod[times[0]]
+            alpha_next = self.alphas_cumprod[times[1]]
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = (1 - alpha_next - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(x_start)
+            img = x_start * alpha_next.sqrt() + \
+                c * previous_frame[2] + \
+                sigma * noise
+
+            if self.box_renewal:  # filter
+                # replenish with randn boxes
+                img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device=img.device)), dim=1)
+            
+            time_cond = torch.full((batch,), times[1], device=self.device, dtype=torch.long)
+
+            self_cond = x_start if self.self_condition else None
+
+            preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
+                                                                        self_cond, clip_x_start=clip_denoised)
+            pred_noise, x_start = preds.pred_noise, preds.pred_x_start
+            
+            if self.box_renewal:  # filter
+                score_per_image, _ = outputs_class[-1][0], outputs_coord[-1][0]
+                threshold = 0.5
+                score_per_image = torch.sigmoid(score_per_image)
+                value, _ = torch.max(score_per_image, -1, keepdim=False)
+                keep_idx = value >= threshold
+                num_remain = torch.sum(keep_idx)
+                pred_noise = pred_noise[:, keep_idx, :]
+                x_start = x_start[:, keep_idx, :]
+                img = img[:, keep_idx, :]
+            img = x_start
+
+            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+            box_cls = output["pred_logits"]
+            box_pred = output["pred_boxes"]
+            results = self.inference(box_cls, box_pred, images.image_sizes)
+        
+
+        if do_postprocess:
+            processed_results = []
+            for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
+                height = input_per_image.get("height", image_size[0])
+                width = input_per_image.get("width", image_size[1])
+                r = detector_postprocess(results_per_image, height, width)
+                processed_results.append({"instances": r})
+            return processed_results, (processed_results, img, pred_noise)
 
     # forward diffusion
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x_start, time, noise=None):
         if noise is None:
             noise = torch.randn_like(x_start)
+
 
         sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
 
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def forward(self, batched_inputs, do_postprocess=True):
+    def forward(self, batched_inputs, previous_frame=None, t=None, do_postprocess=True):
         """
         Args:
             batched_inputs: a list, batched outputs of :class:`DatasetMapper` .
@@ -298,6 +498,8 @@ class DiffusionDet(nn.Module):
                 * "height", "width" (int): the output resolution of the model, used in inference.
                   See :meth:`postprocess` for details.
         """
+        batched_inputs[0]['image'] = batched_inputs[0]['image'].type(torch.uint8)
+        
         images, images_whwh = self.preprocess_image(batched_inputs)
         if isinstance(images, (list, torch.Tensor)):
             images = nested_tensor_from_tensor_list(images)
@@ -311,8 +513,8 @@ class DiffusionDet(nn.Module):
 
         # Prepare Proposals.
         if not self.training:
-            results = self.ddim_sample(batched_inputs, features, images_whwh, images)
-            return results
+            results, prev = self.ddim_sample(batched_inputs, features, images_whwh, images, previous_frame, t)
+            return results, prev
 
         if self.training:
             gt_instances = [x["instances"].to(self.device) for x in batched_inputs]
@@ -431,7 +633,7 @@ class DiffusionDet(nn.Module):
 
         return new_targets, torch.stack(diffused_boxes), torch.stack(noises), torch.stack(ts)
 
-    def inference(self, box_cls, box_pred, image_sizes):
+    def inference(self, box_cls, box_pred, image_sizes, enter=False):
         """
         Arguments:
             box_cls (Tensor): tensor of shape (batch_size, num_proposals, K).
@@ -444,6 +646,7 @@ class DiffusionDet(nn.Module):
         Returns:
             results (List[Instances]): a list of #images elements.
         """
+        
         assert len(box_cls) == len(image_sizes)
         results = []
 
@@ -461,7 +664,7 @@ class DiffusionDet(nn.Module):
                 box_pred_per_image = box_pred_per_image.view(-1, 1, 4).repeat(1, self.num_classes, 1).view(-1, 4)
                 box_pred_per_image = box_pred_per_image[topk_indices]
 
-                if self.use_ensemble and self.sampling_timesteps > 1:
+                if self.use_ensemble and (self.sampling_timesteps > 1 or enter):
                     return box_pred_per_image, scores_per_image, labels_per_image
 
                 if self.use_nms:
@@ -495,7 +698,7 @@ class DiffusionDet(nn.Module):
                 result.scores = scores_per_image
                 result.pred_classes = labels_per_image
                 results.append(result)
-
+        
         return results
 
     def preprocess_image(self, batched_inputs):

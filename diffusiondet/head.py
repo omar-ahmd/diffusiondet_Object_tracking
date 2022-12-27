@@ -166,10 +166,10 @@ class DynamicHead(nn.Module):
                 inter_class_logits.append(class_logits)
                 inter_pred_bboxes.append(pred_bboxes)
             bboxes = pred_bboxes.detach()
-
+        
         if self.return_intermediate:
             return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes)
-
+        
         return class_logits[None], pred_bboxes[None]
 
 
