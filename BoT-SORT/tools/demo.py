@@ -20,6 +20,7 @@ from tracker.tracking_utils.timer import Timer
 
 from detectron2.engine.defaults import DefaultPredictor
 from detectron2.config import get_cfg
+from detectron2.data.detection_utils import read_image
 
 from diffusiondet import add_diffusiondet_config
 from diffusiondet.util.model_ema import add_model_ema_configs
@@ -69,8 +70,8 @@ def make_parser():
 
     # ReID
     parser.add_argument("--with-reid", dest="with_reid", default=False, action="store_true", help="test mot20.")
-    parser.add_argument("--fast-reid-config", dest="fast_reid_config", default=r"fast_reid/configs/MOT17/sbs_S50.yml", type=str, help="reid config file path")
-    parser.add_argument("--fast-reid-weights", dest="fast_reid_weights", default=r"pretrained/mot17_sbs_S50.pth", type=str,help="reid config file path")
+    parser.add_argument("--fast-reid-config", dest="fast_reid_config", default=r"BoT-SORT/fast_reid/configs/MOT17/sbs_S50.yml", type=str, help="reid config file path")
+    parser.add_argument("--fast-reid-weights", dest="fast_reid_weights", default=r"BoT-SORT/pretrained/mot17_sbs_S50.pth", type=str,help="reid config file path")
     parser.add_argument('--proximity_thresh', type=float, default=0.5, help='threshold for rejecting low overlap reid matches')
     parser.add_argument('--appearance_thresh', type=float, default=0.25, help='threshold for rejecting low appearance similarity reid matches')
     return parser
@@ -189,7 +190,26 @@ def image_demo(predictor, vis_folder, current_time, args):
     for frame_id, img_path in enumerate(files, 1):
 
         # Detect objects
-        outputs, img_info = predictor.inference(img_path, timer)
+
+        if args.detector=='yolo':
+            outputs, img_info = predictor.inference(img_path, timer)
+        else:
+            img = read_image(img_path)
+            outputs = predictor(img)
+            boxes = outputs[0]['instances'].get_fields()['pred_boxes'].tensor
+            scores = outputs[0]['instances'].get_fields()['scores'][:, None]
+            classes = outputs[0]['instances'].get_fields()['pred_classes'][:, None]
+            print(scores)
+            print(boxes)
+            outputs = torch.cat((boxes, scores, scores, classes), 1)
+
+            img_info = {}
+            img_info['raw_img'] = img
+            height, width = img.shape[:2]
+            img_info["height"] = height
+            img_info["width"] = width
+            img_info["file_name"] = img_path
+
         scale = min(exp.test_size[0] / float(img_info['height'], ), exp.test_size[1] / float(img_info['width']))
 
         detections = []
@@ -377,8 +397,10 @@ def main(exp, args):
     else:
         trt_file = None
         decoder = None
-
-    predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
+    if args.detector=='yolo':
+        predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
+    else:
+        predictor = get_diffdet(args)
     current_time = time.localtime()
     if args.demo == "image" or args.demo == "images":
         image_demo(predictor, vis_folder, current_time, args)
@@ -391,7 +413,7 @@ def main(exp, args):
 if __name__ == "__main__":
     
     args = make_parser().parse_args()
-    print(get_diffdet(args))
+
     exp = get_exp(args.exp_file, args.name)
 
     args.ablation = False
