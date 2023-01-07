@@ -26,7 +26,7 @@ $ python train_net_MOT.py --num-gpus 1 --config-file <coco config file> --datase
 cd <prb_dir>
 $ python train_net_MOT.py --num-gpus 1 --config-file <coco config file> --dataset MOT17  --as-video yes --time 100 --eval-only MODEL.DiffusionDet.SAMPLE_STEP 1 MODEL.DEVICE cuda MODEL.WEIGHTS <MOT weights> MODEL.DiffusionDet.NUM_CLASSES 1
 ```
-as-video: use or not the previous frame as prior
+as-video: use or not the previous frame as prior\
 time: the time from which you want to start the diffusion process with the use of the previous frame as prior
 
 
