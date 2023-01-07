@@ -1,5 +1,6 @@
 from loguru import logger
-
+import sys
+sys.path.append('./BoT-SORT')
 import torch
 import torch.backends.cudnn as cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -8,7 +9,7 @@ from yolox.core import launch
 from yolox.exp import get_exp
 from yolox.utils import configure_nccl, fuse_model, get_local_rank, get_model_info, setup_logger
 from yolox.evaluators import MOTEvaluator
-
+import numpy as np
 import argparse
 import os
 import random
@@ -34,24 +35,28 @@ def compare_dataframes(gts, ts):
 
 
 # evaluate MOTA
-results_folder = 'YOLOX_outputs/yolox_x_ablation/track_results'
+results_folder = 'exp1/val'
 mm.lap.default_solver = 'lap'
 
-gt_type = '_val_half'
-#gt_type = ''
-print('gt_type', gt_type)
-gtfiles = glob.glob(
-    os.path.join('datasets/mot/train', '*/gt/gt{}.txt'.format(gt_type)))
-print('gt_files', gtfiles)
-tsfiles = [f for f in glob.glob(os.path.join(results_folder, '*.txt')) if not os.path.basename(f).startswith('eval')]
+gtfiles = glob.glob(os.path.join('datasets/MOT17/train', '*FRCNN/gt/gt.txt'))
 
+#print('gt_files', gtfiles)
+tsfiles = [f for f in glob.glob(os.path.join(results_folder, '*.txt')) if not os.path.basename(f).startswith('eval')]
+#print('ts_files', tsfiles)
 logger.info('Found {} groundtruths and {} test files.'.format(len(gtfiles), len(tsfiles)))
 logger.info('Available LAP solvers {}'.format(mm.lap.available_solvers))
 logger.info('Default LAP solver \'{}\''.format(mm.lap.default_solver))
 logger.info('Loading files.')
 
 gt = OrderedDict([(Path(f).parts[-3], mm.io.loadtxt(f, fmt='mot15-2D', min_confidence=1)) for f in gtfiles])
+for g in gt:
+    df = gt[g]
+    train_ = int(0.8*np.unique(df.index.get_level_values('FrameId')).size)+1
+    df_selected = df.loc[df.index.get_level_values('FrameId') >= train_]
+    gt[g] = df_selected
+
 ts = OrderedDict([(os.path.splitext(Path(f).parts[-1])[0], mm.io.loadtxt(f, fmt='mot15-2D', min_confidence=-1.0)) for f in tsfiles])    
+
 
 mh = mm.metrics.create()    
 accs, names = compare_dataframes(gt, ts)
@@ -76,7 +81,8 @@ change_fmt_list = ['num_false_positives', 'num_misses', 'num_switches', 'num_fra
                     'partially_tracked', 'mostly_lost']
 for k in change_fmt_list:
     fmt[k] = fmt['mota']
-print(mm.io.render_summary(summary, formatters=fmt, namemap=mm.io.motchallenge_metric_names))
+
+#print(mm.io.render_summary(summary, formatters=fmt, namemap=mm.io.motchallenge_metric_names))
 
 metrics = mm.metrics.motchallenge_metrics + ['num_objects']
 summary = mh.compute_many(accs, names=names, metrics=metrics, generate_overall=True)

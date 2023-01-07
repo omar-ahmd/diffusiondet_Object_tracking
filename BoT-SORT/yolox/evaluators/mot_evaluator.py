@@ -3,7 +3,9 @@ from collections import defaultdict
 import cv2
 from loguru import logger
 from tqdm import tqdm
-
+import sys
+sys.path.append('./BoT-SORT')
+sys.path.append('./BoT-SORT/tracker')
 import torch
 
 from yolox.utils import (
@@ -15,11 +17,11 @@ from yolox.utils import (
     xyxy2xywh
 )
 
-from trackers.bot_sort_tracker.bot_sort import BoTSORT
-from trackers.byte_tracker.byte_tracker import BYTETracker
-from trackers.sort_tracker.sort import Sort
-from trackers.deepsort_tracker.deepsort import DeepSort
-from trackers.motdt_tracker.motdt_tracker import OnlineTracker
+from tracker.bot_sort import BoTSORT
+#from tracker.byte_tracker.byte_tracker import BYTETracker
+#from tracker.sort_tracker.sort import Sort
+#from tracker.deepsort_tracker.deepsort import DeepSort
+#from tracker.motdt_tracker.motdt_tracker import OnlineTracker
 
 import contextlib
 import io

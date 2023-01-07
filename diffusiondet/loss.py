@@ -129,6 +129,7 @@ class SetCriterionDynamicK(nn.Module):
             src_logits = src_logits.flatten(0, 1)
             target_classes_onehot = target_classes_onehot.flatten(0, 1)
             if self.use_focal:
+                #cls_loss = F.binary_cross_entropy_with_logits(src_logits, target_classes_onehot, reduction="none")
                 cls_loss = sigmoid_focal_loss_jit(src_logits, target_classes_onehot, alpha=self.focal_loss_alpha, gamma=self.focal_loss_gamma, reduction="none")
             else:
                 cls_loss = F.binary_cross_entropy_with_logits(src_logits, target_classes_onehot, reduction="none")
@@ -183,7 +184,7 @@ class SetCriterionDynamicK(nn.Module):
             pred_norm_box_list.append(bz_src_boxes[valid_query] / bz_image_whwh)  # normalize (x1, y1, x2, y2)
             tgt_box_list.append(bz_target_boxes[gt_multi_idx])
             tgt_box_xyxy_list.append(bz_target_boxes_xyxy[gt_multi_idx])
-
+        
         if len(pred_box_list) != 0:
             src_boxes = torch.cat(pred_box_list)
             src_boxes_norm = torch.cat(pred_norm_box_list)  # normalized (x1, y1, x2, y2)
@@ -233,10 +234,10 @@ class SetCriterionDynamicK(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
-
+        
         # Retrieve the matching between the outputs of the last layer and the targets
         indices, _ = self.matcher(outputs_without_aux, targets)
-
+        
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
@@ -308,11 +309,13 @@ class HungarianMatcherDynamicK(nn.Module):
             indices = []
             matched_ids = []
             assert bs == len(targets)
+            
             for batch_idx in range(bs):
                 bz_boxes = out_bbox[batch_idx]  # [num_proposals, 4]
                 bz_out_prob = out_prob[batch_idx]
                 bz_tgt_ids = targets[batch_idx]["labels"]
                 num_insts = len(bz_tgt_ids)
+                
                 if num_insts == 0:  # empty object in key frame
                     non_valid = torch.zeros(bz_out_prob.shape[0]).to(bz_out_prob) > 0
                     indices_batchi = (non_valid, torch.arange(0, 0).to(bz_out_prob))
@@ -320,7 +323,7 @@ class HungarianMatcherDynamicK(nn.Module):
                     indices.append(indices_batchi)
                     matched_ids.append(matched_qidx)
                     continue
-
+                
                 bz_gtboxs = targets[batch_idx]['boxes']  # [num_gt, 4] normalized (cx, xy, w, h)
                 bz_gtboxs_abs_xyxy = targets[batch_idx]['boxes_xyxy']
                 fg_mask, is_in_boxes_and_center = self.get_in_boxes_info(
@@ -330,7 +333,7 @@ class HungarianMatcherDynamicK(nn.Module):
                 )
 
                 pair_wise_ious = ops.box_iou(bz_boxes, bz_gtboxs_abs_xyxy)
-
+                
                 # Compute the classification cost.
                 if self.use_focal:
                     alpha = self.focal_loss_alpha
@@ -357,20 +360,20 @@ class HungarianMatcherDynamicK(nn.Module):
                 bz_out_bbox_ = bz_boxes / bz_image_size_out  # normalize (x1, y1, x2, y2)
                 bz_tgt_bbox_ = bz_gtboxs_abs_xyxy / bz_image_size_tgt  # normalize (x1, y1, x2, y2)
                 cost_bbox = torch.cdist(bz_out_bbox_, bz_tgt_bbox_, p=1)
-
                 cost_giou = -generalized_box_iou(bz_boxes, bz_gtboxs_abs_xyxy)
-
+                
                 # Final cost matrix
                 cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou + 100.0 * (~is_in_boxes_and_center)
                 # cost = (cost_class + 3.0 * cost_giou + 100.0 * (~is_in_boxes_and_center))  # [num_query,num_gt]
+                
                 cost[~fg_mask] = cost[~fg_mask] + 10000.0
-
+                
                 # if bz_gtboxs.shape[0]>0:
                 indices_batchi, matched_qidx = self.dynamic_k_matching(cost, pair_wise_ious, bz_gtboxs.shape[0])
 
                 indices.append(indices_batchi)
                 matched_ids.append(matched_qidx)
-
+            
         return indices, matched_ids
 
     def get_in_boxes_info(self, boxes, target_gts, expanded_strides):

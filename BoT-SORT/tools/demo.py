@@ -7,10 +7,11 @@ import cv2
 import torch
 
 from loguru import logger
-
+from torchvision.io import read_image as ri
+from torchvision.utils import draw_bounding_boxes
 sys.path.append('.')
 sys.path.append('./BoT-SORT')
-
+import torchvision
 from yolox.data.data_augment import preproc
 from yolox.exp import get_exp
 from yolox.utils import fuse_model, get_model_info, postprocess
@@ -24,7 +25,7 @@ from detectron2.data.detection_utils import read_image
 
 from diffusiondet import add_diffusiondet_config
 from diffusiondet.util.model_ema import add_model_ema_configs
-
+import detectron2.data.transforms as T
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -47,20 +48,23 @@ def make_parser():
     parser.add_argument("--fp16", dest="fp16", default=False, action="store_true",help="Adopting mix precision evaluating.")
     parser.add_argument("--fuse", dest="fuse", default=False, action="store_true", help="Fuse conv and bn for testing.")
     parser.add_argument("--trt", dest="trt", default=False, action="store_true", help="Using TensorRT model for testing.")
-    parser.add_argument("--detector", default='yolo', help="Uyolo or diffdet")
+    parser.add_argument("--detector", default='yolo', help="yolo or diffdet")
 
 
     # Diffusion det args
     parser.add_argument("--config-diffdet-file", default='configs/diffdet.coco.res101.yaml')
     parser.add_argument("--config-weights-file", default='models/diffdet_coco_res101.pth')
+    parser.add_argument("--self-condition", action='store_true', default=False)
+    parser.add_argument("--as-video", default='yes')
+    parser.add_argument("--time", default=None)
 
 
     # tracking args
-    parser.add_argument("--track_high_thresh", type=float, default=0.6, help="tracking confidence threshold")
+    parser.add_argument("--track_high_thresh", type=float, default=0.5, help="tracking confidence threshold") #0.6
     parser.add_argument("--track_low_thresh", default=0.1, type=float, help="lowest detection threshold")
-    parser.add_argument("--new_track_thresh", default=0.7, type=float, help="new track thresh")
+    parser.add_argument("--new_track_thresh", default=0.7, type=float, help="new track thresh") #0.7
     parser.add_argument("--track_buffer", type=int, default=30, help="the frames for keep lost tracks")
-    parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking")
+    parser.add_argument("--match_thresh", type=float, default=0.8, help="matching threshold for tracking") #0.8
     parser.add_argument("--aspect_ratio_thresh", type=float, default=1.6, help="threshold for filtering out boxes of which aspect ratio are above the given value.")
     parser.add_argument('--min_box_area', type=float, default=10, help='filter out tiny boxes')
     parser.add_argument("--fuse-score", dest="fuse_score", default=False, action="store_true", help="fuse score and iou for association")
@@ -87,12 +91,12 @@ def get_diffdet(args):
 
     #cfg.DATASETS.TEST = (args.dataset+'_val',)
     #cfg.DATASETS.TRAIN = (args.dataset+'_train',)
-    #cfg.AS_VIDEO = args.as_video
-    #cfg.TIME = args.time
+    cfg.AS_VIDEO = args.as_video
+    cfg.TIME = args.time
     #cfg.T = None
-    cfg.SELF_CONDITION = False
+    cfg.SELF_CONDITION = args.self_condition
 
-    return DefaultPredictor(cfg)
+    return myDefaultPredictor(cfg)
 
 def get_image_list(path):
     image_names = []
@@ -174,6 +178,63 @@ class Predictor(object):
             outputs = postprocess(outputs, self.num_classes, self.confthre, self.nmsthre)
         return outputs, img_info
 
+class myDefaultPredictor(DefaultPredictor):
+    """
+    Create a simple end-to-end predictor with the given config that runs on
+    single device for a single input image.
+
+    Compared to using the model directly, this class does the following additions:
+
+    1. Load checkpoint from `cfg.MODEL.WEIGHTS`.
+    2. Always take BGR image as the input and apply conversion defined by `cfg.INPUT.FORMAT`.
+    3. Apply resizing defined by `cfg.INPUT.{MIN,MAX}_SIZE_TEST`.
+    4. Take one input image and produce a single output, instead of a batch.
+
+    This is meant for simple demo purposes, so it does the above steps automatically.
+    This is not meant for benchmarks or running complicated inference logic.
+    If you'd like to do anything more complicated, please refer to its source code as
+    examples to build and use the model manually.
+
+    Attributes:
+        metadata (Metadata): the metadata of the underlying dataset, obtained from
+            cfg.DATASETS.TEST.
+
+    Examples:
+    ::
+        pred = DefaultPredictor(cfg)
+        inputs = cv2.imread("input.jpg")
+        outputs = pred(inputs)
+    """
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+
+    def __call__(self, original_image, previous=None, time=None):
+        """
+        Args:
+            original_image (np.ndarray): an image of shape (H, W, C) (in BGR order).
+
+        Returns:
+            predictions (dict):
+                the output of the model for one image only.
+                See :doc:`/tutorials/models` for details about the format.
+        """
+        with torch.no_grad():  # https://github.com/sphinx-doc/sphinx/issues/4258
+            # Apply pre-processing to image.
+            if self.input_format == "RGB":
+                # whether the model expects BGR inputs or RGB
+                original_image = original_image[:, :, ::-1]
+            height, width = original_image.shape[:2]
+            image = self.aug.get_transform(original_image).apply_image(original_image)
+            image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+
+            inputs = {"image": image, "height": height, "width": width}
+
+            
+            predictions = self.model([inputs], previous, time)
+            
+            return predictions
+
 
 def image_demo(predictor, vis_folder, current_time, args):
     if osp.isdir(args.path):
@@ -186,23 +247,30 @@ def image_demo(predictor, vis_folder, current_time, args):
 
     timer = Timer()
     results = []
-
+    prev = None
     for frame_id, img_path in enumerate(files, 1):
-
         # Detect objects
-
         if args.detector=='yolo':
             outputs, img_info = predictor.inference(img_path, timer)
+            scale = min(exp.test_size[0] / float(img_info['height'], ), exp.test_size[1] / float(img_info['width']))
+            outputs[0][:, :4] /= scale
+            score = outputs[0][:,4]
+            outputs[0] = outputs[0][score>0.5]
         else:
             img = read_image(img_path)
-            outputs = predictor(img)
+            timer.tic()
+            if not args.self_condition and args.time is None:
+                outputs = predictor(img)[0]
+            else:
+                outputs, prev = predictor(img, prev, [[args.time]])
+
             boxes = outputs[0]['instances'].get_fields()['pred_boxes'].tensor
             scores = outputs[0]['instances'].get_fields()['scores'][:, None]
             classes = outputs[0]['instances'].get_fields()['pred_classes'][:, None]
-            print(scores)
-            print(boxes)
-            outputs = torch.cat((boxes, scores, scores, classes), 1)
-
+            
+            outputs = torch.cat((boxes, scores, classes), 1)
+            
+            outputs = [outputs[outputs[:,-1] == 0]]
             img_info = {}
             img_info['raw_img'] = img
             height, width = img.shape[:2]
@@ -210,13 +278,13 @@ def image_demo(predictor, vis_folder, current_time, args):
             img_info["width"] = width
             img_info["file_name"] = img_path
 
-        scale = min(exp.test_size[0] / float(img_info['height'], ), exp.test_size[1] / float(img_info['width']))
-
+        
+        
         detections = []
         if outputs[0] is not None:
             outputs = outputs[0].cpu().numpy()
-            detections = outputs[:, :7]
-            detections[:, :4] /= scale
+            detections = outputs[:, :]
+            
 
             # Run tracker
             online_targets = tracker.update(detections, img_info['raw_img'])
@@ -247,7 +315,12 @@ def image_demo(predictor, vis_folder, current_time, args):
         # result_image = predictor.visual(outputs[0], img_info, predictor.confthre)
         if args.save_result:
             timestamp = time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            save_folder = osp.join(vis_folder, timestamp)
+            if args.detector=='yolo':
+                save_folder = osp.join(vis_folder, \
+                f"_{args.path.split('/')[-1]}_yolo")
+            else:
+                save_folder = osp.join(vis_folder, \
+                f"_{args.path.split('/')[-1]}_{'SC'if args.self_condition else ''}_{args.time}_{args.config_diffdet_file.split('.')[-2]}")
             os.makedirs(save_folder, exist_ok=True)
             cv2.imwrite(osp.join(save_folder, osp.basename(img_path)), online_im)
 
@@ -259,7 +332,12 @@ def image_demo(predictor, vis_folder, current_time, args):
             break
 
     if args.save_result:
-        res_file = osp.join(vis_folder, f"{timestamp}.txt")
+        if args.detector=='yolo':
+            res_file = osp.join(vis_folder, \
+            f"_{args.path.split('/')[-1]}_yolo.txt")
+        else:
+            res_file = osp.join(vis_folder, \
+            f"_{args.path.split('/')[-1]}_{'SC' if args.self_condition else ''}_{args.time}_{args.config_diffdet_file.split('.')[-2]}.txt")
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
@@ -397,10 +475,12 @@ def main(exp, args):
     else:
         trt_file = None
         decoder = None
+
     if args.detector=='yolo':
         predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     else:
         predictor = get_diffdet(args)
+        
     current_time = time.localtime()
     if args.demo == "image" or args.demo == "images":
         image_demo(predictor, vis_folder, current_time, args)

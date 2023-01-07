@@ -235,7 +235,7 @@ class BoTSORT(object):
         removed_stracks = []
 
         if len(output_results):
-            if output_results.shape[1] == 5:
+            if output_results.shape[1] == 6:
                 scores = output_results[:, 4]
                 bboxes = output_results[:, :4]
                 classes = output_results[:, -1]
@@ -335,7 +335,6 @@ class BoTSORT(object):
             else:
                 track.re_activate(det, self.frame_id, new_id=False)
                 refind_stracks.append(track)
-
         ''' Step 3: Second association, with low score detection boxes'''
         if len(scores):
             inds_high = scores < self.args.track_high_thresh

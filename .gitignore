@@ -3,10 +3,12 @@ output
 output*
 instant_test_output
 inference_test_output
-
-
 *.json
 *.diff
+exp*
+
+# Virutal env
+diffdet/
 
 # compilation and distribution
 __pycache__
@@ -40,16 +42,17 @@ wheels/
 _darcs
 
 # project dirs
-/detectron2/model_zoo/configs
-/datasets/*
+detectron2/model_zoo/configs
+datasets*
 !/datasets/*.*
-/projects/*/datasets
+projects/*/datasets
 
-/pretrained/*
-/YOLOX_outputs/
-/runs/
-/build
-/.idea
+pretrained/*
+*/pretrained/*
+YOLOX_outputs/
+runs/
+build
+.idea
 /*.pyc
 /tools/private/
 wandb/

@@ -50,8 +50,10 @@ from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.modeling import build_model
 from detectron2.data.common import DatasetFromList, MapDataset
 from detectron2.data.dataset_mapper import DatasetMapper
-from detectron2.data.samplers import InferenceSampler
+from detectron2.data.samplers import InferenceSampler, TrainingSampler
 from  detectron2.evaluation import inference_context
+
+from  detectron2.structures import BoxMode
 
 from os.path import exists
 import torch.utils.data as torchdata
@@ -72,55 +74,12 @@ class MOTEvaluator(DatasetEvaluator):
         use_fast_impl=True,
         kpt_oks_sigmas=(),
     ):
-        """
-        Args:
-            dataset_name (str): name of the dataset to be evaluated.
-                It must have either the following corresponding metadata:
-
-                    "json_file": the path to the COCO format annotation
-
-                Or it must be in detectron2's standard dataset format
-                so it can be converted to COCO format automatically.
-            tasks (tuple[str]): tasks that can be evaluated under the given
-                configuration. A task is one of "bbox", "segm", "keypoints".
-                By default, will infer this automatically from predictions.
-            distributed (True): if True, will collect results from all ranks and run evaluation
-                in the main process.
-                Otherwise, will only evaluate the results in the current process.
-            output_dir (str): optional, an output directory to dump all
-                results predicted on the dataset. The dump contains two files:
-
-                1. "instances_predictions.pth" a file that can be loaded with `torch.load` and
-                   contains all the results in the format they are produced by the model.
-                2. "coco_instances_results.json" a json file in COCO's result format.
-            max_dets_per_image (int): limit on the maximum number of detections per image.
-                By default in COCO, this limit is to 100, but this can be customized
-                to be greater, as is needed in evaluation metrics AP fixed and AP pool
-                (see https://arxiv.org/pdf/2102.01066.pdf)
-                This doesn't affect keypoint evaluation.
-            use_fast_impl (bool): use a fast but **unofficial** implementation to compute AP.
-                Although the results should be very close to the official implementation in COCO
-                API, it is still recommended to compute results with the official API for use in
-                papers. The faster implementation also uses more RAM.
-            kpt_oks_sigmas (list[float]): The sigmas used to calculate keypoint OKS.
-                See http://cocodataset.org/#keypoints-eval
-                When empty, it will use the defaults in COCO.
-                Otherwise it should be the same length as ROI_KEYPOINT_HEAD.NUM_KEYPOINTS.
-            allow_cached_coco (bool): Whether to use cached coco json from previous validation
-                runs. You should set this to False if you need to use different validation data.
-                Defaults to True.
-        """
         self._logger = logging.getLogger(__name__)
         self._distributed = distributed
         self._output_dir = output_dir
 
         self._use_fast_impl = use_fast_impl
 
-        # MOTeval requires the limit on the number of detections per image (maxDets) to be a list
-        # with at least 3 elements. The default maxDets in COCOeval is [1, 10, 100], in which the
-        # 3rd element (100) is used as the limit on the number of detections per image when
-        # evaluating AP. COCOEvaluator expects an integer for max_dets_per_image, so for COCOeval,
-        # we reformat max_dets_per_image into [1, 10, max_dets_per_image], based on the defaults.
         if max_dets_per_image is None:
             max_dets_per_image = [1, 10, 100]
         else:
@@ -165,8 +124,8 @@ class MOTEvaluator(DatasetEvaluator):
 
         gt[4] = gt[4].clip(0,int(self.config['Sequence']['imWidth']))
         gt[5] = gt[5].clip(0,int(self.config['Sequence']['imHeight']))
-        gt = gt[gt[8]>=0.5] #Take only the boxes that have a visibility grater than 0.5
-        self.gt = gt
+        gt = gt[gt[8]>=0.3] #Take only the boxes that have a visibility grater than 0.3
+        self.gt = gt[gt[7]==1]
         self.results = None
 
     def reset(self):
@@ -183,16 +142,16 @@ class MOTEvaluator(DatasetEvaluator):
         """
         for input, output in zip(inputs, outputs):
             prediction = {"image_id": input["image_id"]}
+
             if "instances" in output:
                 instances = output["instances"].to(self._cpu_device)
                 prediction["instances"] = instances_to_coco_json(instances, input["image_id"])
             if "proposals" in output:
                 prediction["proposals"] = output["proposals"].to(self._cpu_device)
-            
             if len(prediction) > 1:
                 self._predictions.append(prediction)
 
-    def evaluate(self, img_ids=None):
+    def evaluate(self, img_ids=None, time=None):
         """
         Args:
             img_ids: a list of image IDs to evaluate on. Default to None for the whole dataset
@@ -206,8 +165,8 @@ class MOTEvaluator(DatasetEvaluator):
                 return {}
         else:
             predictions = self._predictions
+
         if len(predictions) == 0:
-            
             self._logger.warning("[COCOEvaluator] Did not receive valid predictions.")
             return {}
 
@@ -219,41 +178,42 @@ class MOTEvaluator(DatasetEvaluator):
 
         self._results = OrderedDict()
         if "instances" in predictions[0]:
-            mAP = self._eval_predictions(predictions, img_ids=img_ids)
+            mAP = self._eval_predictions(predictions, img_ids=img_ids, time=time)
             
         # Copy so the caller can do whatever with results
         return mAP, copy.deepcopy(self._results)
 
-    def _eval_predictions(self, predictions, img_ids=None):
+    def _eval_predictions(self, predictions, img_ids=None, time=None):
 
         """
         Evaluate predictions. Fill self._results with the metrics of the tasks.
         """
         self._logger.info(f"Preparing results for {self.dataset_name} format ...")
         mot_results = list(itertools.chain(*[x["instances"] for x in predictions]))
-        for result in mot_results:
-            category_id = result["category_id"]
-        
-        # unmap the category ids for MOT
-        if hasattr(self._metadata, "thing_dataset_id_to_contiguous_id"):
-            dataset_id_to_contiguous_id = self._metadata.thing_dataset_id_to_contiguous_id
-            all_contiguous_ids = list(dataset_id_to_contiguous_id.values())
-            num_classes = len(all_contiguous_ids)
-            assert min(all_contiguous_ids) == 0 and max(all_contiguous_ids) == num_classes - 1
-
-            reverse_id_mapping = {v: k for k, v in dataset_id_to_contiguous_id.items()}
-            for result in mot_results:
-                category_id = result["category_id"]
-                
-                assert category_id < num_classes, (
-                    f"A prediction has class={category_id}, "
-                    f"but the dataset only has {num_classes} classes and "
-                    f"predicted class id should be in [0, {num_classes - 1}]."
-                )
-                result["category_id"] = reverse_id_mapping[category_id]
+        category_id=[]
+        ## unmap the category ids for MOT
+        #if hasattr(self._metadata, "thing_dataset_id_to_contiguous_id"):
+        #    dataset_id_to_contiguous_id = self._metadata.thing_dataset_id_to_contiguous_id
+        #    all_contiguous_ids = list(dataset_id_to_contiguous_id.values())
+        #    num_classes = len(all_contiguous_ids)
+        #    assert min(all_contiguous_ids) == 0 and max(all_contiguous_ids) == num_classes - 1
+#
+        #    reverse_id_mapping = {v: k for k, v in dataset_id_to_contiguous_id.items()}
+        #    for result in mot_results:
+        #        category_id = result["category_id"]
+        #        
+        #        assert category_id < num_classes, (
+        #            f"A prediction has class={category_id}, "
+        #            f"but the dataset only has {num_classes} classes and "
+        #            f"predicted class id should be in [0, {num_classes - 1}]."
+        #        )
+        #        result["category_id"] = reverse_id_mapping[category_id]
 
         if self._output_dir:
-            file_path = os.path.join(self._output_dir, self.dataset_name + "_instances_results.json")
+            if time:
+                file_path = os.path.join(self._output_dir, self.dataset_name + f"_{time}_instances_results.json")
+            else:
+                file_path = os.path.join(self._output_dir, self.dataset_name + f"_instances_results.json")
             self._logger.info("Saving results to {}".format(file_path))
             with PathManager.open(file_path, "w") as f:
                 self.results = mot_results
@@ -270,21 +230,28 @@ class MOTEvaluator(DatasetEvaluator):
         boxes1 = self.results
         boxes1 = boxes1[boxes1.score>THRESH]
         metric = MeanAveragePrecision()
-        for id in range(1,int(self.config['Sequence']['seqLength'])+1,1):
-            person_boxes = boxes1[np.logical_and(boxes1.category_id==1,boxes1.image_id==id)]
+        for id in np.unique(boxes1.image_id):
+            person_boxes = boxes1[np.logical_and(boxes1.category_id==0, boxes1.image_id==id)]
+            #person_boxes = boxes1[boxes1.image_id==id]
             preds = [
             dict(
                 boxes=torch.tensor(np.array(person_boxes.bbox.values.tolist())),
                 scores=torch.tensor(person_boxes.score.values),
-                labels=torch.tensor(person_boxes.category_id.values),
+                labels=(torch.tensor(person_boxes.category_id.values)+1),
             )
             ]
             target = [
             dict(
-                boxes=torch.tensor(self.gt[np.logical_and(self.gt[7]==1, self.gt.image_id==id)].iloc[:,2:6].values),
-                labels=torch.tensor(self.gt[np.logical_and(self.gt[7]==1, self.gt.image_id==id)].iloc[:,7].values),
+                boxes=torch.tensor(self.gt[self.gt.image_id==id].iloc[:,2:6].values),
+                labels=torch.tensor(self.gt[self.gt.image_id==id].iloc[:,7].values),
             )
             ]
+            #target = [
+            #dict(
+            #    boxes=torch.tensor(self.gt[np.logical_and(self.gt[7]==1,self.gt.image_id==id)].iloc[:,2:6].values),
+            #    labels=torch.tensor(self.gt[np.logical_and(self.gt[7]==1,self.gt.image_id==id)].iloc[:,7].values),
+            #)
+            #]
             
             metric.update(preds, target)
         
@@ -316,6 +283,8 @@ class Trainer(DefaultTrainer):
         data_loader = self.build_train_loader(cfg)
 
         model = create_ddp_model(model, broadcast_buffers=False)
+        
+
         self._trainer = (AMPTrainer if cfg.SOLVER.AMP.ENABLED else SimpleTrainer)(
             model, data_loader, optimizer
         )
@@ -337,7 +306,7 @@ class Trainer(DefaultTrainer):
         self.start_iter = 0
         self.max_iter = cfg.SOLVER.MAX_ITER
         self.cfg = cfg
-
+        self.output_dir = cfg.OUTPUT_DIR
         self.register_hooks(self.build_hooks())
 
     @classmethod
@@ -375,8 +344,64 @@ class Trainer(DefaultTrainer):
 
     @classmethod
     def build_train_loader(cls, cfg):
-        mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
-        return build_detection_train_loader(cfg, mapper=mapper)
+        if 'MOT17' in cfg.DATASETS.TRAIN[0]:
+            if not exists('datasets/MOT17'):
+                raise ValueError('datasets/MOT17 directory does not exist')
+
+            imgs = glob.glob('datasets/MOT17/train/*-DPM/img1/*')
+
+            instances = glob.glob('datasets/MOT17/train/*-DPM/gt/*')
+
+            dataset_dict=[]
+            for vid in instances:
+                config = configparser.ConfigParser()
+                
+
+                vid_id = vid.split('MOT17-')[-1].split('-')[0]
+                config.read(f'datasets/MOT17/train/MOT17-{vid_id}-DPM/seqinfo.ini')
+                gt = pd.read_csv(vid, header=None)
+                img_dic={}
+                train_ = int(np.unique(gt[0]).shape[0]*float(cfg.TRAIN_SIZE))
+                for frame_id in np.sort(np.unique(gt[0]))[:train_]:
+                    img_dic['file_name'] = np.array(imgs)[['MOT17-'+vid_id in i and str(frame_id).zfill(6) in i for i in imgs]][0]
+                    img_dic['image_id'] = vid_id + '_' + str(frame_id)
+                    annotations=[]
+                    
+                    for box in gt[gt[0]==frame_id].values:
+                        ann = {}
+                        box[4] = box[4] + box[2]
+                        box[5] = box[5] + box[3]
+
+                        box[4] = box[4].clip(0,int(config['Sequence']['imWidth']))
+                        box[5] = box[5].clip(0,int(config['Sequence']['imHeight']))
+
+                        ann['bbox'] = [box[2], box[3], box[4], box[5]]
+
+                        ann['category_id'] = int(box[7])-1
+                        ann['bbox_mode'] = BoxMode.XYXY_ABS
+                        ann['iscrowd'] =  0
+                        visibility = box[8]
+                        if visibility>0.2 and ann['category_id']==0:
+                            annotations.append(ann)
+                    img_dic['annotations'] = annotations
+                    dataset_dict.append(img_dic)
+
+            
+            dataset = DatasetFromList(dataset_dict, copy=False)
+            mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
+            dataset = MapDataset(dataset, mapper)
+            sampler = TrainingSampler(len(dataset))
+            dataloaders = torchdata.DataLoader(dataset,
+                                                    batch_size=cfg.SOLVER.IMS_PER_BATCH,
+                                                    sampler=sampler,
+                                                    drop_last=False,
+                                                    collate_fn=trivial_batch_collator,
+                                                )  
+                                 
+            return dataloaders
+        else:
+            mapper = DiffusionDetDatasetMapper(cfg, is_train=True)
+            return build_detection_train_loader(cfg, mapper=mapper)
 
     @classmethod
     def build_test_loader(cls, cfg, dataset_name):
@@ -405,23 +430,22 @@ class Trainer(DefaultTrainer):
             # Each video will have its own dataloader
             dataloaders = {}
             for vid in dataset_dict:
-                if vid=='04':
-                    dataset_dict[vid] = sorted(dataset_dict[vid], key=lambda x: x['image_id'])
-                    dataset = DatasetFromList(dataset_dict[vid], copy=False)
-                    mapper = DatasetMapper(cfg, False)
-                    dataset = MapDataset(dataset, mapper)
-                    sampler = InferenceSampler(len(dataset))
-                    dataloaders[vid] = torchdata.DataLoader(dataset,
-                                                            batch_size=1,
-                                                            sampler=sampler,
-                                                            drop_last=False,
-                                                            collate_fn=trivial_batch_collator,
-                                                        )
+                train_ = int(len(dataset_dict[vid])*float(cfg.TRAIN_SIZE))
+                dataset_dict[vid] = sorted(dataset_dict[vid], key=lambda x: x['image_id'])[train_:]
+                dataset = DatasetFromList(dataset_dict[vid], copy=False)
+                mapper = DatasetMapper(cfg, False)
+                dataset = MapDataset(dataset, mapper)
+                sampler = InferenceSampler(len(dataset))
+                dataloaders[vid] = torchdata.DataLoader(dataset,
+                                                        batch_size=1,
+                                                        sampler=sampler,
+                                                        drop_last=False,
+                                                        collate_fn=trivial_batch_collator,
+                                                    )
             return dataloaders
         else:
             return {'1':super().build_test_loader(cfg, dataset_name)}
 
-    
     @classmethod
     def build_optimizer(cls, cfg, model):
         params: List[Dict[str, Any]] = []
@@ -503,15 +527,17 @@ class Trainer(DefaultTrainer):
             # When evaluators are passed in as arguments,
             # implicitly assume that evaluators can be created before data_loader.
             df_t = pd.DataFrame()
-
+            
             # Going through all dataloaders
             for data_loader in data_loaders:
                 if evaluators is not None:
                     evaluator = evaluators[idx]
                     
                 print(f'---------------------------------{dataset_name}-{data_loader} Evaluation---------------------------------')
-                if not exists('output/inference/mAP'):
-                    os.mkdir('output/inference/mAP')
+                if not exists(cfg.OUTPUT_DIR + '/inference'):
+                    os.mkdir(cfg.OUTPUT_DIR + '/inference')
+                if not exists(cfg.OUTPUT_DIR + '/inference/mAP'):
+                    os.mkdir(cfg.OUTPUT_DIR + '/inference/mAP')
                 # When at least one time is passed as argument
                 if len(cfg.TIME)>0:
                     df = pd.DataFrame()
@@ -536,7 +562,7 @@ class Trainer(DefaultTrainer):
                     print(tabulate(df, headers='keys', tablefmt='psql'))
                 
                     json_f = df.to_json()
-                    file_path = os.path.join('output/inference/mAP', dataset_name + '_' + data_loader + ".json")
+                    file_path = os.path.join(cfg.OUTPUT_DIR + '/inference/mAP', dataset_name + '_' + data_loader + ".json")
                     
                     with PathManager.open(file_path, "w") as f:
                         f.write(json.dumps(json_f))
@@ -559,14 +585,13 @@ class Trainer(DefaultTrainer):
                     results[data_loader] = results_i
                     df_t = pd.DataFrame()
                     df_t[0] = results_i[0]
-                    df_t[1] = results_i[0]
 
                     df_t = df_t.applymap(tensor_to_elem)
                     print(tabulate(df_t, headers='keys', tablefmt='psql'))
                 
                 json_f = df_t.to_json()
                 
-                file_path = os.path.join('output/inference/mAP', dataset_name + ".json")
+                file_path = os.path.join(cfg.OUTPUT_DIR + '/inference/mAP', dataset_name + ".json")
                 
                 with PathManager.open(file_path, "w") as f:
                     f.write(json.dumps(json_f))
@@ -659,19 +684,19 @@ class Trainer(DefaultTrainer):
                 print(f'---------------------------------time={cfg.T}---------------------------------')
             except: pass
             for idx, inputs in tqdm(enumerate(data_loader)):
-
                 if cfg.AS_VIDEO=='yes':
-                    outputs = model(inputs, previous, cfg.AS_VIDEO=='yes')[0]
-                    previous = outputs[0]['instances']._fields['pred_boxes'].tensor
-                    previous = torch.unsqueeze(previous, dim=0)
+                    outputs, previous = model(inputs, previous, cfg.T)
                 else:
                     outputs, _ = model(inputs)
 
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
+
                 evaluator.process(inputs, outputs)
-                
-        results = evaluator.evaluate()
+        if cfg.T:
+            results = evaluator.evaluate(cfg.T)
+        else:
+            results = evaluator.evaluate()
         # An evaluator may return None when not in main process.
         # Replace it by an empty dict instead to make it easier for downstream code to handle
         if results is None:
@@ -715,7 +740,7 @@ class Trainer(DefaultTrainer):
 
         def test_and_save_results():
             self._last_eval_results = self.test(self.cfg, self.model)
-            return self._last_eval_results
+            return None
 
         # Do evaluation after checkpointer, because then if it fails,
         # we can use the saved checkpoint to debug.
@@ -753,7 +778,10 @@ def setup(args):
     cfg.DATASETS.TRAIN = (args.dataset+'_train',)
     cfg.AS_VIDEO = args.as_video
     cfg.TIME = args.time
-    cfg.WITH_NMS = args.with_nms
+    cfg.T = None
+    cfg.SELF_CONDITION = args.self_condition
+    cfg.TRAIN_SIZE = args.train_size
+
     #cfg.freeze()
     #default_setup(cfg, args)
     
@@ -798,11 +826,11 @@ if __name__ == "__main__":
                                                             as intialisation in diffusiondet")
     parser.add_argument("--time", default=[], action='append', nargs='+', help="if as-video is yes, from which \
                                                     time you want to apply the diffusion process")
-    parser.add_argument("--with-nms", default='no', help="if yes, apply the NMS on the detected boxes at the \
-                                                    given times")
+    parser.add_argument("--self-condition", default=False, help="Take the previous frame as condition if True") 
+    parser.add_argument("--train-size", default=0.8)                                                
     
     args = parser.parse_args()
-    #print("Command Line Args:", args)
+    print("Command Line Args:", args)
     launch(
         main,
         args.num_gpus,

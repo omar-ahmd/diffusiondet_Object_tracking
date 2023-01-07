@@ -6,7 +6,7 @@ import importlib
 import os
 import sys
 
-
+sys.path.append('./BoT-SORT')
 def get_exp_by_file(exp_file):
     try:
         sys.path.append(os.path.dirname(exp_file))

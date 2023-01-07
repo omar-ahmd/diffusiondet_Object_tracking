@@ -115,13 +115,13 @@ class DiffusionDetDatasetMapper:
             for anno in dataset_dict["annotations"]:
                 anno.pop("segmentation", None)
                 anno.pop("keypoints", None)
-
             # USER: Implement additional transformations if you have other types of data
             annos = [
                 utils.transform_instance_annotations(obj, transforms, image_shape)
                 for obj in dataset_dict.pop("annotations")
                 if obj.get("iscrowd", 0) == 0
             ]
+            
             instances = utils.annotations_to_instances(annos, image_shape)
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict
