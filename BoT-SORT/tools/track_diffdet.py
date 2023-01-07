@@ -55,7 +55,7 @@ def make_parser():
     
     # Diffusion det args
     parser.add_argument("--config-diffdet-file", default='configs/diffdet.mot.swinbase.yaml')
-    parser.add_argument("--config-weights-file", default='output_swin1/model_0002999.pth')
+    parser.add_argument("--weights-file", default='output_swin1/model_0002999.pth')
     parser.add_argument("--self-condition", action='store_true', default=False)
     parser.add_argument("--as-video", default='yes')
     parser.add_argument("--time", default=None)

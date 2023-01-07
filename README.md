@@ -1,47 +1,42 @@
-## DiffusionDet: Diffusion Model for Object Detection
+#   DiffsuionDet for object tracking
+This code is based on the implementation of [DiffusionDet](https://github.com/ShoufaChen/DiffusionDet), [BoT-SORT](https://github.com/NirAharon/BoT-SORT#bot-sort)
+The main contribution of this work is to use the previous frame as an intialization in the diffusion process to imporve its preformance on object tracking, and to prepare the enviroment to train the diffusiondet on MOT dataset
 
-**DiffusionDet is the first work of diffusion model for object detection.**
+# 1.Data Preparation
+Download [MOT17](https://motchallenge.net/data/MOT17/) from the [official website](https://motchallenge.net/). And put them in the following structure:
 
-![](teaser.png)
-
-
-> [**DiffusionDet: Diffusion Model for Object Detection**](https://arxiv.org/abs/2211.09788)               
-> [Shoufa Chen](https://www.shoufachen.com/), [Peize Sun](https://peizesun.github.io/), [Yibing Song](https://ybsong00.github.io/), [Ping Luo](http://luoping.me/)                 
-> *[arXiv 2211.09788](https://arxiv.org/abs/2211.09788)* 
-
-## Updates
-- (11/2022) Code is released.
-
-## Models
-Method | Box AP (1 step) | Box AP (4 step) | Download
---- |:---:|:---:|:---:
-[COCO-Res50](configs/diffdet.coco.res50.yaml) | 45.5 | 46.1 | [model](https://github.com/ShoufaChen/DiffusionDet/releases/download/v0.1/diffdet_coco_res50.pth)
-[COCO-Res101](configs/diffdet.coco.res101.yaml) | 46.6 | 46.9 | [model](https://github.com/ShoufaChen/DiffusionDet/releases/download/v0.1/diffdet_coco_res101.pth)
-[COCO-SwinBase](configs/diffdet.coco.swinbase.yaml) | 52.3 | 52.7 | [model](https://github.com/ShoufaChen/DiffusionDet/releases/download/v0.1/diffdet_coco_swinbase.pth)
-[LVIS-Res50](configs/diffdet.lvis.res50.yaml) | 30.4 | 31.8 | [model](https://github.com/ShoufaChen/DiffusionDet/releases/download/v0.1/diffdet_lvis_res50.pth)
-[LVIS-Res101](configs/diffdet.lvis.res101.yaml) | 31.9 | 32.9 | [model](https://github.com/ShoufaChen/DiffusionDet/releases/download/v0.1/diffdet_lvis_res101.pth)
-[LVIS-SwinBase](configs/diffdet.lvis.swinbase.yaml) | 40.6 | 41.9 | [model](https://github.com/ShoufaChen/DiffusionDet/releases/download/v0.1/diffdet_lvis_swinbase.pth)
-
-
-## Getting Started
-
-The installation instruction and usage are in [Getting Started with DiffusionDet](GETTING_STARTED.md).
-
-
-## License
-
-This project is under the CC-BY-NC 4.0 license. See [LICENSE](LICENSE) for details.
-
-
-## Citing DiffusionDet
-
-If you use DiffusionDet in your research or wish to refer to the baseline results published here, please use the following BibTeX entry.
-
-```BibTeX
-@article{chen2022diffusiondet,
-      title={DiffusionDet: Diffusion Model for Object Detection},
-      author={Chen, Shoufa and Sun, Peize and Song, Yibing and Luo, Ping},
-      journal={arXiv preprint arXiv:2211.09788},
-      year={2022}
-}
 ```
+<dataets_dir>
+      │
+      ├── MOT17
+             ├── train
+             └── test    
+      
+```   
+                    
+# 2.Training DiffsuionDet
+Single GPU training
+```
+cd <prb_dir>
+$ python train_net_MOT.py --num-gpus 1 --config-file <coco config file> --dataset MOT17 --resume  MODEL.DiffusionDet.SAMPLE_STEP 1 MODEL.DEVICE cuda MODEL.WEIGHTS <coco weights>  SOLVER.IMS_PER_BATCH 4 MODEL.DiffusionDet.NUM_CLASSES 1
+```
+
+# 3.Inference
+```
+cd <prb_dir>
+$ python train_net_MOT.py --num-gpus 1 --config-file <coco config file> --dataset MOT17  --as-video yes --time 100 --eval-only MODEL.DiffusionDet.SAMPLE_STEP 1 MODEL.DEVICE cuda MODEL.WEIGHTS <MOT weights> MODEL.DiffusionDet.NUM_CLASSES 1
+```
+as-video: use or not the previous frame as prior
+time: the time from which you want to start the diffusion process with the use of the previous frame as prior
+
+
+# 4.Tracking
+```
+cd <prb_dir>
+$ python BoT-SORT/tools/track_diffdet.py ./datasets/MOT17 --default-parameters --eval val --config-diffdet-file <coco config file>  --weights-file <finetuned MOT weights> --time 100
+```
+time: the time from which you want to start your diffusion process with the use of the previous frame as prior
+
+
+# 5.Acknowledgement
+A large part of the codes are borrowed from [DiffsuionDet](https://github.com/ShoufaChen/DiffusionDet), [BoT-SORT](https://github.com/NirAharon/BoT-SORT#bot-sort), thanks for their excellent work!
