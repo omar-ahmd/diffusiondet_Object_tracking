@@ -185,7 +185,7 @@ def get_diffdet(args):
     add_model_ema_configs(cfg)
     cfg.MODEL.DEVICE = 'cuda:2'
     cfg.merge_from_file(args.config_diffdet_file)
-    cfg.merge_from_list(['MODEL.WEIGHTS', args.config_weights_file])
+    cfg.merge_from_list(['MODEL.WEIGHTS', args.weights_file])
 
 
     #cfg.DATASETS.TEST = (args.dataset+'_val',)
@@ -244,20 +244,18 @@ def image_track(predictor, vis_folder, args):
         boxes = outputs[0]['instances'].get_fields()['pred_boxes'].tensor
         scores = outputs[0]['instances'].get_fields()['scores'][:, None]
         classes = outputs[0]['instances'].get_fields()['pred_classes'][:, None]
-        boxes = boxes[scores[:,0]>0.05]
-        classes = classes[scores[:,0]>0.05]
-        scores = scores[scores[:,0]>0.05]
+        #boxes = boxes[scores[:,0]>0.3]
+        #classes = classes[scores[:,0]>0.3]
+        #scores = scores[scores[:,0]>0.3]
         
-
-        #scores[scores[:,0]>0.1] = ((scores[scores[:,0]>0.1] - scores[scores[:,0]>0.1].min()) / (scores[scores[:,0]>0.1].max() - scores[scores[:,0]>0.1].min()))/2 + 0.5
-        #scores[scores[:,0]<0.1] = ((scores[scores[:,0]<0.1]) / (scores[scores[:,0]<0.1].max()))/2 
         
         outputs = torch.cat((boxes, scores, classes), 1)
-        
-        #print(outputs[outputs[:,-2]>0.05].shape, frame_id)
-
+        #im = ri(img_path)
+        #im = draw_bounding_boxes(im, boxes, fill=False, width=3)
+        #im = torchvision.transforms.ToPILImage()(im)
 
         outputs = [outputs[outputs[:,-1] == 0]]
+        #im.save(f'{vis_folder}/{frame_id}.png')
         
         img_info = {}
         img_info['raw_img'] = img
@@ -265,12 +263,25 @@ def image_track(predictor, vis_folder, args):
         img_info["height"] = height
         img_info["width"] = width
         img_info["file_name"] = img_path
-        
-        
+        conf_thre=0.0001
+        nms_thre=0.65
         if outputs[0] is not None:
-            outputs = outputs[0].cpu().numpy()
-            detections = outputs[:, :7]
+            
+            detections = outputs[0][:, :6]
 
+            conf_mask = (detections[:, 4] >= conf_thre).squeeze()
+            detections = detections[conf_mask]
+            
+
+            nms_out_index = torchvision.ops.batched_nms(
+                detections[:, :4],
+                detections[:, 4] ,
+                detections[:, 5],
+                nms_thre,
+            )
+
+            detections = detections[nms_out_index]
+            detections = detections.cpu().numpy()
             trackerTimer.tic()
             online_targets = tracker.update(detections, img_info["raw_img"])
             trackerTimer.toc()
@@ -295,11 +306,11 @@ def image_track(predictor, vis_folder, args):
             online_im = plot_tracking(
                 img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
             )
-            out.write(online_im)
+            
         else:
             timer.toc()
             online_im = img_info['raw_img']
-
+        out.write(online_im)
         if args.save_frames:
             save_folder = osp.join(vis_folder, args.name)
             os.makedirs(save_folder, exist_ok=True)
@@ -400,7 +411,7 @@ if __name__ == "__main__":
 
             if args.default_parameters:
                 args.track_high_thresh = 0.5
-                args.track_low_thresh = 0.05
+                args.track_low_thresh = 0.1
                 args.track_buffer = 30
 
                 if seq == 'MOT17-05-FRCNN' or seq == 'MOT17-06-FRCNN':
@@ -424,6 +435,7 @@ if __name__ == "__main__":
                 args.new_track_thresh = args.track_high_thresh + 0.1
             
             main(args)
+        break
             
             
 

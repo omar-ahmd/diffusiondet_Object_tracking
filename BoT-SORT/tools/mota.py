@@ -65,6 +65,7 @@ logger.info('Running metrics')
 metrics = ['recall', 'precision', 'num_unique_objects', 'mostly_tracked',
             'partially_tracked', 'mostly_lost', 'num_false_positives', 'num_misses',
             'num_switches', 'num_fragmentations', 'mota', 'motp', 'num_objects']
+#metrics = ['recall', 'precision','mota', 'motp']
 summary = mh.compute_many(accs, names=names, metrics=metrics, generate_overall=True)
 # summary = mh.compute_many(accs, names=names, metrics=mm.metrics.motchallenge_metrics, generate_overall=True)
 # print(mm.io.render_summary(

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 sys.path.append('./BoT-SORT')
 sys.path.append('.')
-
+import json
 from loguru import logger
 import configparser
 from yolox.data.data_augment import preproc
@@ -170,19 +170,18 @@ def image_track(predictor, vis_folder, args):
     vid = files[0].split('/')[-3]
     output_path = f'{vis_folder}/{vid}.avi'
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'DIVX'), int(config['Sequence']['framerate']), frameSize)
-
+    data = {}
     for img_path in files:
         frame_id = int(img_path.split('/')[-1].split('.')[0])
         # Detect objects
         outputs, img_info = predictor.inference(img_path, timer)
         scale = min(exp.test_size[0] / float(img_info['height'], ), exp.test_size[1] / float(img_info['width']))
-
+        
         if outputs[0] is not None:
             outputs = outputs[0].cpu().numpy()
             detections = outputs[:, :7]
             detections[:, :4] /= scale
-            print(detections[:,5].min(), frame_id)
-
+            data[frame_id] = detections.tolist()
             trackerTimer.tic()
             online_targets = tracker.update(detections, img_info["raw_img"])
             trackerTimer.toc()
@@ -219,6 +218,10 @@ def image_track(predictor, vis_folder, args):
 
         if frame_id % 20 == 0:
             logger.info('Processing frame {}/{} ({:.2f} fps)'.format(frame_id, num_frames, 1. / max(1e-5, timer.average_time)))
+    
+    
+    with open(f'{vis_folder}/{vid}.json', "w") as fp:
+        json.dump(data,fp) 
     out.release()
     res_file = osp.join(vis_folder, args.name + ".txt")
 

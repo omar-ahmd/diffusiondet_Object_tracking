@@ -323,6 +323,22 @@ class Trainer(DefaultTrainer):
         #logger.info("Model:\n{}".format(model))
         # setup EMA
         may_build_model_ema(cfg, model)
+        for param in model.parameters():
+            param.requires_grad = False
+
+        for name, layer in model.named_children():
+            if name=='head':
+                for param in layer.parameters():
+                    param.requires_grad = True
+
+        #for head in list(list(list(model.children())[1].children())[1].children()):
+        #    children = list(head.named_children())
+        #    for name, layer in children:
+        #        if name in ['cls_module', 'reg_module', 'class_logits', 'bboxes_delta']:
+        #            for param in layer.parameters():
+        #                param.requires_grad = True
+            
+
         return model
 
     @classmethod
@@ -781,7 +797,7 @@ def setup(args):
     cfg.T = None
     cfg.SELF_CONDITION = args.self_condition
     cfg.TRAIN_SIZE = args.train_size
-
+    cfg.SOLVER.BASE_LR = 2.5e-5
     #cfg.freeze()
     #default_setup(cfg, args)
     
